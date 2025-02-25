@@ -11,30 +11,30 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__TokenAddressesAndPriceFeedAddressesMustBeSameLength();
     error DSCEngine__NotAllowedToken();
     error DSCEngine__TransferFailed();
+    error DSCEngine__BreaksHealthFactor(uint256 healthFactor);
+    error DSCEngine__MintFailed();
+
     uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
     uint256 private constant PRECISION = 1e18; // 换算精度
     uint256 private constant LIQUIDATION_THRESHOLD = 50; //清算阈值
     uint256 private constant LIQUIDATION_PRECISION = 100; //清算精度
+    uint256 private constant MIN_HEALTH_FACTOR = 1; //最小健康因子
     // 代币和喂价映射
     mapping(address token => address priceFeed) private s_priceFeeds;
     // 用户和代币和数量映射
-    mapping(address user => mapping(address token => uint256 amount))
-        private s_collateralDeposited;
+    mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
     mapping(address user => uint256 amountDSC) private s_DSCMinted;
     // 存储符合erc20的代币作为抵押物的数组
     address[] private s_collateralTokens;
     // 稳定币dsb对象
     DecentralizedStableCoin private immutable i_dsc;
 
-    event CollateralDeposited(
-        address indexed user,
-        address indexed token,
-        uint256 amount
-    );
+    event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
     /**
      * @dev Modifier to ensure that the amount is greater than zero.
      * @notice This modifier is used to ensure that the amount is greater than zero.
      */
+
     modifier moreThanZero(uint256 amount) {
         if (amount <= 0) {
             revert DSCEngine__NeedsMoreThanZero();
@@ -72,35 +72,23 @@ contract DSCEngine is ReentrancyGuard {
      */
     function depositCollateralAndMintDsc() external {}
 
-    function depositCollateral(
-        address tokenCollateralAddress,
-        uint256 amountCollateral
-    )
+    function depositCollateral(address tokenCollateralAddress, uint256 amountCollateral)
         external
         moreThanZero(amountCollateral)
         isAllowedToken(tokenCollateralAddress)
         nonReentrant
     {
         //
-        s_collateralDeposited[msg.sender][
-            tokenCollateralAddress
-        ] += amountCollateral;
-        emit CollateralDeposited(
-            msg.sender,
-            tokenCollateralAddress,
-            amountCollateral
-        );
-        bool success = IERC20(tokenCollateralAddress).transferFrom(
-            msg.sender,
-            address(this),
-            amountCollateral
-        );
+        s_collateralDeposited[msg.sender][tokenCollateralAddress] += amountCollateral;
+        emit CollateralDeposited(msg.sender, tokenCollateralAddress, amountCollateral);
+        bool success = IERC20(tokenCollateralAddress).transferFrom(msg.sender, address(this), amountCollateral);
         if (!success) {
             revert DSCEngine__TransferFailed();
         }
     }
 
-    /***
+    /**
+     *
      * @notice This function allows users to redeem collateral for DSC.
      * @notice 用户可以赎回Dsc并换取抵押资产
      */
@@ -113,11 +101,13 @@ contract DSCEngine is ReentrancyGuard {
      * @param amountDscToMint The amount of decentralized stablecoin to mint.
      * @notice This function allows users to mint DSC with collateral.
      */
-    function mintDsc(
-        uint256 amountDscToMint
-    ) external moreThanZero(amountDscToMint) nonReentrant {
+    function mintDsc(uint256 amountDscToMint) external moreThanZero(amountDscToMint) nonReentrant {
         s_DSCMinted[msg.sender] += amountDscToMint;
         _revertIfHealthFactorIsBroken(msg.sender);
+        bool minted = i_dsc.mint(msg.sender, amountDscToMint);
+        if (!minted) {
+            revert DSCEngine__MintFailed();
+        }
     }
 
     function burnDsc() external {}
@@ -137,9 +127,7 @@ contract DSCEngine is ReentrancyGuard {
     ////////////////////////////////////
     //       Helper Functions         //
     ////////////////////////////////////
-    function _getAccountInfomation(
-        address user
-    )
+    function _getAccountInfomation(address user)
         private
         view
         returns (uint256 totalDscMinted, uint256 collateralValueInUsd)
@@ -150,21 +138,20 @@ contract DSCEngine is ReentrancyGuard {
     }
 
     function _healthFactor(address user) private view returns (uint256) {
-        (
-            uint256 totalDscMinted,
-            uint256 collateralValueInUsd
-        ) = _getAccountInfomation(user);
+        (uint256 totalDscMinted, uint256 collateralValueInUsd) = _getAccountInfomation(user);
         //健康因子 = (抵押物价值 * 清算阈值) / 债务总量(已经mint的dsc);
-        uint256 collateralAdjustedForThreshold = (collateralValueInUsd *
-            LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
+        uint256 collateralAdjustedForThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
         return (collateralAdjustedForThreshold * PRECISION) / totalDscMinted;
     }
 
-    function _revertIfHealthFactorIsBroken(address _user) internal view {}
+    function _revertIfHealthFactorIsBroken(address _user) internal view {
+        uint256 userHealthFactor = _healthFactor(_user);
+        if (userHealthFactor < MIN_HEALTH_FACTOR) {
+            revert DSCEngine__BreaksHealthFactor(userHealthFactor);
+        }
+    }
 
-    function getAccountCollateralValue(
-        address user
-    ) public view returns (uint256 totalCollateralValue) {
+    function getAccountCollateralValue(address user) public view returns (uint256 totalCollateralValue) {
         for (uint256 i = 0; i < s_collateralTokens.length; i++) {
             // 获取系统规定的可以抵押的某个代币
             address token = s_collateralTokens[i];
@@ -175,15 +162,9 @@ contract DSCEngine is ReentrancyGuard {
         }
     }
 
-    function getUsdValue(
-        address token,
-        uint256 amount
-    ) public view returns (uint256) {
-        AggregatorV3Interface priceFeed = AggregatorV3Interface(
-            s_priceFeeds[token]
-        );
-        (, int256 price, , , ) = priceFeed.latestRoundData();
-        return
-            ((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION; //price 1*1e8 amount 2  2
+    function getUsdValue(address token, uint256 amount) public view returns (uint256) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        return ((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION; //price 1*1e8 amount 2  2
     }
 }
