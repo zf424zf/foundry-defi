@@ -30,6 +30,7 @@ contract DSCEngine is ReentrancyGuard {
     DecentralizedStableCoin private immutable i_dsc;
 
     event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
+    event CollateralRedeemed(address indexed redeemedFrom, address indexed redeemedTo, uint256 amount);
     /**
      * @dev Modifier to ensure that the amount is greater than zero.
      * @notice This modifier is used to ensure that the amount is greater than zero.
@@ -70,10 +71,17 @@ contract DSCEngine is ReentrancyGuard {
      * @notice This function allows users to deposit collateral and mint DSC tokens.
      * @notice 用户抵押资产并铸造Dsc(例如抵押eth铸造dsc)
      */
-    function depositCollateralAndMintDsc() external {}
+    function depositCollateralAndMintDsc(
+        address tokenCollateralAddress,
+        uint256 amountCollateral,
+        uint256 amountDscToMint
+    ) external {
+        depositCollateral(tokenCollateralAddress, amountCollateral);
+        mintDsc(amountDscToMint);
+    }
 
     function depositCollateral(address tokenCollateralAddress, uint256 amountCollateral)
-        external
+        public
         moreThanZero(amountCollateral)
         isAllowedToken(tokenCollateralAddress)
         nonReentrant
@@ -92,16 +100,35 @@ contract DSCEngine is ReentrancyGuard {
      * @notice This function allows users to redeem collateral for DSC.
      * @notice 用户可以赎回Dsc并换取抵押资产
      */
-    function redeemCollateralForDsc() external {}
+    function redeemCollateralForDsc(address tokenCollateralAddress, uint256 amountCollateral, uint256 amountDscToBurn)
+        external
+    {
+        burnDsc(amountDscToBurn);
+        redeemCollateral(tokenCollateralAddress, amountCollateral);
+    }
 
-    function redeemCollateral() external {}
+    function redeemCollateral(address tokenCollateralAddress, uint256 amountCollateral)
+        public
+        moreThanZero(amountCollateral)
+        nonReentrant
+    {
+        // 减少用户抵押的代币数量
+        s_collateralDeposited[msg.sender][tokenCollateralAddress] -= amountCollateral;
+        //出发赎回抵押物事件，记录用户地址，用户抵押的代币地址和数量
+        emit CollateralRedeemed(msg.sender, tokenCollateralAddress, amountCollateral);
+        bool success = IERC20(tokenCollateralAddress).transfer(msg.sender, amountCollateral);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     /**
      *
      * @param amountDscToMint The amount of decentralized stablecoin to mint.
      * @notice This function allows users to mint DSC with collateral.
      */
-    function mintDsc(uint256 amountDscToMint) external moreThanZero(amountDscToMint) nonReentrant {
+    function mintDsc(uint256 amountDscToMint) public moreThanZero(amountDscToMint) nonReentrant {
         s_DSCMinted[msg.sender] += amountDscToMint;
         _revertIfHealthFactorIsBroken(msg.sender);
         bool minted = i_dsc.mint(msg.sender, amountDscToMint);
@@ -110,7 +137,19 @@ contract DSCEngine is ReentrancyGuard {
         }
     }
 
-    function burnDsc() external {}
+    function burnDsc(uint256 amount) public moreThanZero(amount) {
+        //扣除用户的dsc数量
+        s_DSCMinted[msg.sender] -= amount;
+        // 将用户地址的dsc数量转移到合约地址
+        bool success = i_dsc.transferFrom(msg.sender, address(this), amount);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        // 燃烧掉已经铸造的dsc
+        i_dsc.burn(amount);
+        // 判断用户是否健康
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     /**
      * @notice This function allows users to liquidate other users' collateral.
@@ -136,6 +175,11 @@ contract DSCEngine is ReentrancyGuard {
         // 获取用户抵押的代币数量和代币对应的usd价格
         collateralValueInUsd = getAccountCollateralValue(user);
     }
+    /*
+     * @param user The user whose health factor needs to be calculated.
+     * @notice This function calculates the health factor of a user.
+     * @dev This function is called by other functions to ensure that the health factor of a user remains within a safe range. 
+     */
 
     function _healthFactor(address user) private view returns (uint256) {
         (uint256 totalDscMinted, uint256 collateralValueInUsd) = _getAccountInfomation(user);
@@ -144,6 +188,12 @@ contract DSCEngine is ReentrancyGuard {
         return (collateralAdjustedForThreshold * PRECISION) / totalDscMinted;
     }
 
+    /**
+     *
+     * @param _user The user whose health factor needs to be checked.
+     * @notice This function reverts if the health factor of a user is below the minimum allowed value.
+     * @dev This function is called by other functions to ensure that the health factor of a user remains within a safe range.
+     */
     function _revertIfHealthFactorIsBroken(address _user) internal view {
         uint256 userHealthFactor = _healthFactor(_user);
         if (userHealthFactor < MIN_HEALTH_FACTOR) {
