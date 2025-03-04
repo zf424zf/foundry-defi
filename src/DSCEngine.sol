@@ -13,12 +13,15 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__TransferFailed();
     error DSCEngine__BreaksHealthFactor(uint256 healthFactor);
     error DSCEngine__MintFailed();
+    error DSCEngine__HealthFactorOk();
+    error DSCEngine__HealthFactorNotImproved(); // 清算失败
 
-    uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
+    uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10; // chainlink eth喂价精度为8位，需要再同步的精度值为1e10
     uint256 private constant PRECISION = 1e18; // 换算精度
     uint256 private constant LIQUIDATION_THRESHOLD = 50; //清算阈值
     uint256 private constant LIQUIDATION_PRECISION = 100; //清算精度
-    uint256 private constant MIN_HEALTH_FACTOR = 1; //最小健康因子
+    uint256 private constant MIN_HEALTH_FACTOR = 1e18; //最小健康因子
+    uint256 private constant LIQUIDATION_BONUS = 10; //清算人奖励
     // 代币和喂价映射
     mapping(address token => address priceFeed) private s_priceFeeds;
     // 用户和代币和数量映射
@@ -30,7 +33,9 @@ contract DSCEngine is ReentrancyGuard {
     DecentralizedStableCoin private immutable i_dsc;
 
     event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
-    event CollateralRedeemed(address indexed redeemedFrom, address indexed redeemedTo, uint256 amount);
+    event CollateralRedeemed(
+        address indexed redeemedFrom, address indexed redeemedTo, address indexed token, uint256 amount
+    );
     /**
      * @dev Modifier to ensure that the amount is greater than zero.
      * @notice This modifier is used to ensure that the amount is greater than zero.
@@ -43,6 +48,7 @@ contract DSCEngine is ReentrancyGuard {
         _;
     }
 
+    // 验证抵押物是否为系统规定的抵押物
     modifier isAllowedToken(address token) {
         if (s_priceFeeds[token] == address(0)) {
             revert DSCEngine__NotAllowedToken();
@@ -112,14 +118,7 @@ contract DSCEngine is ReentrancyGuard {
         moreThanZero(amountCollateral)
         nonReentrant
     {
-        // 减少用户抵押的代币数量
-        s_collateralDeposited[msg.sender][tokenCollateralAddress] -= amountCollateral;
-        //出发赎回抵押物事件，记录用户地址，用户抵押的代币地址和数量
-        emit CollateralRedeemed(msg.sender, tokenCollateralAddress, amountCollateral);
-        bool success = IERC20(tokenCollateralAddress).transfer(msg.sender, amountCollateral);
-        if (!success) {
-            revert DSCEngine__TransferFailed();
-        }
+        _redeemCollateral(msg.sender, msg.sender, tokenCollateralAddress, amountCollateral);
         _revertIfHealthFactorIsBroken(msg.sender);
     }
 
@@ -138,15 +137,7 @@ contract DSCEngine is ReentrancyGuard {
     }
 
     function burnDsc(uint256 amount) public moreThanZero(amount) {
-        //扣除用户的dsc数量
-        s_DSCMinted[msg.sender] -= amount;
-        // 将用户地址的dsc数量转移到合约地址
-        bool success = i_dsc.transferFrom(msg.sender, address(this), amount);
-        if (!success) {
-            revert DSCEngine__TransferFailed();
-        }
-        // 燃烧掉已经铸造的dsc
-        i_dsc.burn(amount);
+        _burnDsc(msg.sender, msg.sender, amount);
         // 判断用户是否健康
         _revertIfHealthFactorIsBroken(msg.sender);
     }
@@ -155,7 +146,33 @@ contract DSCEngine is ReentrancyGuard {
      * @notice This function allows users to liquidate other users' collateral.
      * @notice 用户可以清算其他用户的抵押资产
      */
-    function liquidate() external {}
+    function liquidate(address collateral, address user, uint256 debtToCover)
+        external
+        moreThanZero(debtToCover)
+        nonReentrant
+    {
+        uint256 startingUserHealthFactor = _healthFactor(user);
+        if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
+            revert DSCEngine__HealthFactorOk();
+        }
+        // 获取当前债务的抵押物价值
+        uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(collateral, debtToCover);
+        // 获取清算奖励,以被清算者的抵押资产作为数量
+        uint256 bonusCollateral = (tokenAmountFromDebtCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+        // 计算清算人所获取的总收益
+        uint256 totalCollateralToRedeem = tokenAmountFromDebtCovered + bonusCollateral;
+        //将抵押资产转给清算人
+        _redeemCollateral(user, msg.sender, collateral, totalCollateralToRedeem);
+        // 清算人的dsc数量
+        _burnDsc(user, msg.sender, debtToCover);
+        // 判断被清算的用户是否健康
+        uint256 endingUserHealthFactor = _healthFactor(user);
+        if (endingUserHealthFactor <= startingUserHealthFactor) {
+            revert DSCEngine__HealthFactorNotImproved();
+        }
+        // 判断清算人的健康因子是否正常
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     /**
      * @notice This function calculates the health factor of a user.
@@ -166,6 +183,39 @@ contract DSCEngine is ReentrancyGuard {
     ////////////////////////////////////
     //       Helper Functions         //
     ////////////////////////////////////
+    function getTokenAmountFromUsd(address token, uint256 usdAmountInWei) public view returns (uint256) {
+        // 获取抵押物对应的usd价格
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        // 获取债务目前值多少个抵押物
+        return (usdAmountInWei * PRECISION) / (uint256(price) * ADDITIONAL_FEED_PRECISION);
+    }
+
+    function _burnDsc(address burnFromUser, address dscFrom, uint256 amountDscToBurn) private {
+        //扣除用户的dsc数量
+        s_DSCMinted[burnFromUser] -= amountDscToBurn;
+        // 将用户地址的dsc数量转移到合约地址
+        bool success = i_dsc.transferFrom(dscFrom, address(this), amountDscToBurn);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        // 燃烧掉已经铸造的dsc
+        i_dsc.burn(amountDscToBurn);
+    }
+
+    function _redeemCollateral(address from, address to, address tokenCollateralAddress, uint256 amountCollateral)
+        private
+    {
+        // 减少用户抵押的代币数量
+        s_collateralDeposited[from][tokenCollateralAddress] -= amountCollateral;
+        //出发赎回抵押物事件，记录用户地址，用户抵押的代币地址和数量
+        emit CollateralRedeemed(from, to, tokenCollateralAddress, amountCollateral);
+        bool success = IERC20(tokenCollateralAddress).transfer(to, amountCollateral);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+    }
+
     function _getAccountInfomation(address user)
         private
         view
