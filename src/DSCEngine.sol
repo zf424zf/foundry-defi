@@ -11,7 +11,7 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__TokenAddressesAndPriceFeedAddressesMustBeSameLength();
     error DSCEngine__NotAllowedToken();
     error DSCEngine__TransferFailed();
-    error DSCEngine__BreaksHealthFactor(uint256 healthFactor);
+    error DSCEngine__BreaksHealthFactor();
     error DSCEngine__MintFailed();
     error DSCEngine__HealthFactorOk();
     error DSCEngine__HealthFactorNotImproved(); // 清算失败
@@ -128,8 +128,8 @@ contract DSCEngine is ReentrancyGuard {
      * @notice This function allows users to mint DSC with collateral.
      */
     function mintDsc(uint256 amountDscToMint) public moreThanZero(amountDscToMint) nonReentrant {
-        s_DSCMinted[msg.sender] += amountDscToMint;
-        _revertIfHealthFactorIsBroken(msg.sender);
+        s_DSCMinted[msg.sender] += amountDscToMint; // 修改用户已经mint的数据
+        _revertIfHealthFactorIsBroken(msg.sender); //检查健康因子
         bool minted = i_dsc.mint(msg.sender, amountDscToMint);
         if (!minted) {
             revert DSCEngine__MintFailed();
@@ -173,12 +173,6 @@ contract DSCEngine is ReentrancyGuard {
         // 判断清算人的健康因子是否正常
         _revertIfHealthFactorIsBroken(msg.sender);
     }
-
-    /**
-     * @notice This function calculates the health factor of a user.
-     * @notice 用户可以查看自己的健康因子
-     */
-    function getHealthFactor() external view {}
 
     ////////////////////////////////////
     //       Helper Functions         //
@@ -232,7 +226,11 @@ contract DSCEngine is ReentrancyGuard {
      */
 
     function _healthFactor(address user) private view returns (uint256) {
-        (uint256 totalDscMinted, uint256 collateralValueInUsd) = _getAccountInfomation(user);
+        uint256 totalDscMinted = s_DSCMinted[user];
+        if (totalDscMinted == 0) {
+            return type(uint256).max;
+        }
+        (, uint256 collateralValueInUsd) = _getAccountInfomation(user);
         //健康因子 = (抵押物价值 * 清算阈值) / 债务总量(已经mint的dsc);
         uint256 collateralAdjustedForThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
         return (collateralAdjustedForThreshold * PRECISION) / totalDscMinted;
@@ -247,8 +245,12 @@ contract DSCEngine is ReentrancyGuard {
     function _revertIfHealthFactorIsBroken(address _user) internal view {
         uint256 userHealthFactor = _healthFactor(_user);
         if (userHealthFactor < MIN_HEALTH_FACTOR) {
-            revert DSCEngine__BreaksHealthFactor(userHealthFactor);
+            revert DSCEngine__BreaksHealthFactor();
         }
+    }
+
+    function getUserHealthFactor(address user) public view returns (uint256) {
+        return _healthFactor(user);
     }
 
     function getAccountCollateralValue(address user) public view returns (uint256 totalCollateralValue) {
@@ -266,5 +268,37 @@ contract DSCEngine is ReentrancyGuard {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
         (, int256 price,,,) = priceFeed.latestRoundData();
         return ((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION; //price 1*1e8 amount 2  2
+    }
+
+    function getAccountInfomation(address user)
+        external
+        view
+        returns (uint256 totalDscMinted, uint256 collateralValueInUsd)
+    {
+        (totalDscMinted, collateralValueInUsd) = _getAccountInfomation(user);
+    }
+
+    function getLiquidationThreshold() public pure returns (uint256) {
+        return LIQUIDATION_THRESHOLD;
+    }
+
+    function getLiquidationPrecision() public pure returns (uint256) {
+        return LIQUIDATION_PRECISION;
+    }
+
+    function getPrecision() public pure returns (uint256) {
+        return PRECISION;
+    }
+
+    function getCollateralTokens() public view returns (address[] memory) {
+        return s_collateralTokens;
+    }
+
+    function getCollateralBalanceOfUser(address user, address token) external view returns (uint256) {
+        return s_collateralDeposited[user][token];
+    }
+
+    function getLiquidationBonus() public pure returns (uint256) {
+        return LIQUIDATION_BONUS;
     }
 }
